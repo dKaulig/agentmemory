@@ -84,6 +84,14 @@ export class OpenAIProvider implements MemoryProvider {
 
   private async call(systemPrompt: string, userPrompt: string): Promise<string> {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
+    // One budget for the whole operation. The retry below must not get a
+    // second full timeout, or a slow initial rejection would let a single
+    // call() run for nearly twice the configured bound.
+    const deadline = Date.now() + this.timeoutMs;
+    const timedOut = () =>
+      new Error(
+        `OpenAI API request timed out after ${this.timeoutMs}ms — set OPENAI_TIMEOUT_MS (or AGENTMEMORY_LLM_TIMEOUT_MS) to raise the bound or check the provider status.`,
+      );
     const send = (tokenLimitParam: "max_tokens" | "max_completion_tokens") => {
       const body: Record<string, unknown> = {
         model: this.model,
@@ -110,6 +118,10 @@ export class OpenAIProvider implements MemoryProvider {
       // OPENAI_TIMEOUT_MS keeps its v0.9.17 meaning (OpenAI-scoped alias,
       // takes precedence); when unset we fall through to
       // AGENTMEMORY_LLM_TIMEOUT_MS and finally the 60s default. See #446.
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw timedOut();
+      }
       return fetchWithTimeout(
         url,
         {
@@ -117,42 +129,43 @@ export class OpenAIProvider implements MemoryProvider {
           headers: buildAuthHeaders(this.apiKey, this.isAzure),
           body: JSON.stringify(body),
         },
-        this.timeoutMs,
+        remaining,
       );
     };
 
     let response: Response;
+    // Read once: the same body serves both the retry decision and the error
+    // message, so there is no cloned branch left unconsumed.
+    let errorText: string | null = null;
     try {
       response = await send(this.tokenLimitParam);
 
-      // gpt-5 family / o-series reject `max_tokens` with a 400 that names the
-      // parameter they do accept. Switch once and retry, then keep the new
-      // spelling for the lifetime of this provider so the cost is a single
-      // extra round trip per process, not per request.
-      if (
-        !response.ok &&
-        response.status === 400 &&
-        this.tokenLimitParam === "max_tokens"
-      ) {
-        const text = await response.clone().text();
-        if (text.includes("max_completion_tokens")) {
+      if (!response.ok) {
+        errorText = await response.text();
+        // gpt-5 family / o-series reject `max_tokens` with a 400 that names
+        // the parameter they do accept. Switch once and retry, then keep the
+        // new spelling for the lifetime of this provider so the cost is a
+        // single extra round trip per process, not per request.
+        if (
+          response.status === 400 &&
+          this.tokenLimitParam === "max_tokens" &&
+          errorText.includes("max_completion_tokens")
+        ) {
           this.tokenLimitParam = "max_completion_tokens";
           response = await send(this.tokenLimitParam);
+          errorText = response.ok ? null : await response.text();
         }
       }
     } catch (err) {
       const aborted = err instanceof Error && err.name === "AbortError";
       if (aborted) {
-        throw new Error(
-          `OpenAI API request timed out after ${this.timeoutMs}ms — set OPENAI_TIMEOUT_MS (or AGENTMEMORY_LLM_TIMEOUT_MS) to raise the bound or check the provider status.`,
-        );
+        throw timedOut();
       }
       throw err;
     }
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`OpenAI API error (${response.status}): ${text}`);
+      throw new Error(`OpenAI API error (${response.status}): ${errorText}`);
     }
 
     const data = (await response.json()) as {

@@ -37,6 +37,42 @@ function bodyOf(call: unknown[]): Record<string, unknown> {
 describe("OpenAIProvider — max_tokens vs max_completion_tokens", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
+    delete process.env["OPENAI_TIMEOUT_MS"];
+  });
+
+  it("shares one timeout budget across the retry", async () => {
+    // A slow rejection must eat into the budget the retry gets, otherwise a
+    // single call() could run for close to 2x the configured timeout.
+    process.env["OPENAI_TIMEOUT_MS"] = "300";
+    const fetchMock = vi
+      .fn()
+      .mockImplementationOnce(
+        async () =>
+          await new Promise<Response>((resolve) =>
+            setTimeout(() => resolve(new Response(UNSUPPORTED_MAX_TOKENS, { status: 400 })), 200),
+          ),
+      )
+      // the retry hangs; only the remaining ~100ms should be granted to it
+      .mockImplementation(
+        (_url: string, init: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => {
+              const err = new Error("aborted");
+              err.name = "AbortError";
+              reject(err);
+            });
+          }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new OpenAIProvider("k", "gpt-5.4-mini", 800, "https://api.example.com");
+    const started = Date.now();
+    await expect(provider.compress("sys", "user")).rejects.toThrow(/timed out after 300ms/);
+    const elapsed = Date.now() - started;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // ~300ms total. A per-request budget would let this reach ~500ms.
+    expect(elapsed).toBeLessThan(450);
   });
 
   it("sends max_tokens by default", async () => {
