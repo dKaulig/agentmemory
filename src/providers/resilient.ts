@@ -1,24 +1,9 @@
 import type { MemoryProvider, CircuitBreakerState } from "../types.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 
-/**
- * A rejection that means "this particular payload is not acceptable" rather
- * than "the provider is unhealthy".
- *
- * Azure OpenAI content filters are the motivating case. Prompt Shields flags
- * tool output that merely *looks* like a jailbreak — a README describing
- * prompt injection, a security test fixture, an error log quoting user input:
- *
- *   400 {"error":{"code":"content_filter", ...
- *        "innererror":{"code":"ResponsibleAIPolicyViolation",
- *        "content_filter_result":{"jailbreak":{"detected":true,"filtered":true}}}}}
- *
- * Counting those as provider failures means three filtered observations inside
- * the failure window trip the breaker, and every *other* compression then
- * fails with `circuit_breaker_open` for the recovery timeout. One awkward file
- * costs a batch of unrelated observations. The provider is answering fine, so
- * leave the breaker closed and let just that one call fail.
- */
+// Azure Prompt Shields rejects ordinary material — a SECURITY.md describing
+// prompt injection is enough — so these arrive often enough to trip the
+// breaker and take unrelated compressions down with them. See #1276.
 export function isPayloadRejection(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /content_filter|ResponsibleAIPolicyViolation/.test(message);
