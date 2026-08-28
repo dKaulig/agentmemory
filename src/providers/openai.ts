@@ -54,6 +54,13 @@ export class OpenAIProvider implements MemoryProvider {
   private timeoutMs: number;
   private isAzure: boolean;
   private azureApiVersion: string;
+  // Newer OpenAI models (gpt-5 family, o-series) reject `max_tokens` and
+  // require `max_completion_tokens` instead. Which spelling an endpoint wants
+  // cannot be derived from the model string: Azure deployment names are
+  // user-chosen and OpenAI-compatible proxies differ. So start with the widely
+  // supported spelling and latch onto the other one the first time the API
+  // asks for it — see the 400 handling in `call()`.
+  private tokenLimitParam: "max_tokens" | "max_completion_tokens" = "max_tokens";
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
     this.apiKey = apiKey;
@@ -77,34 +84,33 @@ export class OpenAIProvider implements MemoryProvider {
 
   private async call(systemPrompt: string, userPrompt: string): Promise<string> {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
-    const body: Record<string, unknown> = {
-      model: this.model,
-      max_tokens: this.maxTokens,
-      // OpenAI API spec defines `stream` as defaulting to false, so omitting
-      // it should yield a JSON response. Some OpenAI-compatible proxies
-      // (notably 9Router < 0.4.56 — see decolua/9router#1260) default to
-      // text/event-stream when `stream` is absent, which crashes the
-      // `response.json()` call below with `Unexpected token 'd', "data: {"id"...`.
-      // Send it explicitly so non-spec endpoints route to non-streaming too.
-      stream: false,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    };
-    if (this.reasoningEffort) {
-      body.reasoning_effort = this.reasoningEffort;
-    }
+    const send = (tokenLimitParam: "max_tokens" | "max_completion_tokens") => {
+      const body: Record<string, unknown> = {
+        model: this.model,
+        [tokenLimitParam]: this.maxTokens,
+        // OpenAI API spec defines `stream` as defaulting to false, so omitting
+        // it should yield a JSON response. Some OpenAI-compatible proxies
+        // (notably 9Router < 0.4.56 — see decolua/9router#1260) default to
+        // text/event-stream when `stream` is absent, which crashes the
+        // `response.json()` call below with `Unexpected token 'd', "data: {"id"...`.
+        // Send it explicitly so non-spec endpoints route to non-streaming too.
+        stream: false,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt },
+        ],
+      };
+      if (this.reasoningEffort) {
+        body.reasoning_effort = this.reasoningEffort;
+      }
 
-    // Bound the request via the shared fetchWithTimeout helper, which
-    // owns the AbortController + clearTimeout cleanup for every raw-fetch
-    // provider (minimax, openrouter, gemini, openrouter-embed, etc.).
-    // OPENAI_TIMEOUT_MS keeps its v0.9.17 meaning (OpenAI-scoped alias,
-    // takes precedence); when unset we fall through to
-    // AGENTMEMORY_LLM_TIMEOUT_MS and finally the 60s default. See #446.
-    let response: Response;
-    try {
-      response = await fetchWithTimeout(
+      // Bound the request via the shared fetchWithTimeout helper, which
+      // owns the AbortController + clearTimeout cleanup for every raw-fetch
+      // provider (minimax, openrouter, gemini, openrouter-embed, etc.).
+      // OPENAI_TIMEOUT_MS keeps its v0.9.17 meaning (OpenAI-scoped alias,
+      // takes precedence); when unset we fall through to
+      // AGENTMEMORY_LLM_TIMEOUT_MS and finally the 60s default. See #446.
+      return fetchWithTimeout(
         url,
         {
           method: "POST",
@@ -113,6 +119,27 @@ export class OpenAIProvider implements MemoryProvider {
         },
         this.timeoutMs,
       );
+    };
+
+    let response: Response;
+    try {
+      response = await send(this.tokenLimitParam);
+
+      // gpt-5 family / o-series reject `max_tokens` with a 400 that names the
+      // parameter they do accept. Switch once and retry, then keep the new
+      // spelling for the lifetime of this provider so the cost is a single
+      // extra round trip per process, not per request.
+      if (
+        !response.ok &&
+        response.status === 400 &&
+        this.tokenLimitParam === "max_tokens"
+      ) {
+        const text = await response.clone().text();
+        if (text.includes("max_completion_tokens")) {
+          this.tokenLimitParam = "max_completion_tokens";
+          response = await send(this.tokenLimitParam);
+        }
+      }
     } catch (err) {
       const aborted = err instanceof Error && err.name === "AbortError";
       if (aborted) {
