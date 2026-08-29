@@ -54,12 +54,9 @@ export class OpenAIProvider implements MemoryProvider {
   private timeoutMs: number;
   private isAzure: boolean;
   private azureApiVersion: string;
-  // Newer OpenAI models (gpt-5 family, o-series) reject `max_tokens` and
-  // require `max_completion_tokens` instead. Which spelling an endpoint wants
-  // cannot be derived from the model string: Azure deployment names are
-  // user-chosen and OpenAI-compatible proxies differ. So start with the widely
-  // supported spelling and latch onto the other one the first time the API
-  // asks for it — see the 400 handling in `call()`.
+  // Which spelling an endpoint accepts cannot be derived from the model
+  // string: Azure deployment names are user-chosen and proxies differ, so it
+  // is learned from the first rejection instead. See #1219.
   private tokenLimitParam: "max_tokens" | "max_completion_tokens" = "max_tokens";
 
   constructor(apiKey: string, model: string, maxTokens: number, baseURL?: string) {
@@ -84,9 +81,8 @@ export class OpenAIProvider implements MemoryProvider {
 
   private async call(systemPrompt: string, userPrompt: string): Promise<string> {
     const url = buildChatUrl(this.baseUrl, this.isAzure, this.azureApiVersion);
-    // One budget for the whole operation. The retry below must not get a
-    // second full timeout, or a slow initial rejection would let a single
-    // call() run for nearly twice the configured bound.
+    // Spans the retry too: two full timeouts would put one call() at nearly
+    // twice the configured bound.
     const deadline = Date.now() + this.timeoutMs;
     const timedOut = () =>
       new Error(
@@ -134,21 +130,18 @@ export class OpenAIProvider implements MemoryProvider {
     };
 
     let response: Response;
-    // Read once: the same body serves both the retry decision and the error
-    // message, so there is no cloned branch left unconsumed.
     let errorText: string | null = null;
     try {
-      response = await send(this.tokenLimitParam);
+      const attempted = this.tokenLimitParam;
+      response = await send(attempted);
 
       if (!response.ok) {
         errorText = await response.text();
-        // gpt-5 family / o-series reject `max_tokens` with a 400 that names
-        // the parameter they do accept. Switch once and retry, then keep the
-        // new spelling for the lifetime of this provider so the cost is a
-        // single extra round trip per process, not per request.
+        // Concurrent calls each judge the rejection against what they sent:
+        // the shared field may already carry a spelling this request predates.
         if (
           response.status === 400 &&
-          this.tokenLimitParam === "max_tokens" &&
+          attempted === "max_tokens" &&
           errorText.includes("max_completion_tokens")
         ) {
           this.tokenLimitParam = "max_completion_tokens";

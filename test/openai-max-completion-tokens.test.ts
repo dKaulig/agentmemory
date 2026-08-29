@@ -123,6 +123,36 @@ describe("OpenAIProvider — max_tokens vs max_completion_tokens", () => {
     expect(bodyOf(fetchMock.mock.calls[2]!)["max_completion_tokens"]).toBe(800);
   });
 
+  it("retries both calls when two are in flight before the spelling is learned", async () => {
+    // Both requests go out with max_tokens before either rejection is handled.
+    // If the second call tests the shared field instead of what it actually
+    // sent, it sees the spelling the first call just latched and gives up.
+    let pending: ((r: Response) => void)[] = [];
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string) as Record<string, unknown>;
+      if (body["max_completion_tokens"] !== undefined) return ok("<observation/>");
+      // hold every max_tokens request until both are in flight
+      return await new Promise<Response>((resolve) => {
+        pending.push(resolve);
+        if (pending.length === 2) {
+          const waiting = pending;
+          pending = [];
+          for (const r of waiting) r(new Response(UNSUPPORTED_MAX_TOKENS, { status: 400 }));
+        }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const provider = new OpenAIProvider("k", "gpt-5.4-mini", 800, "https://api.example.com");
+    const results = await Promise.all([
+      provider.compress("sys", "first"),
+      provider.compress("sys", "second"),
+    ]);
+
+    expect(results).toEqual(["<observation/>", "<observation/>"]);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
   it("does not retry on unrelated 400s", async () => {
     const fetchMock = vi.fn().mockImplementation(
       async () =>
