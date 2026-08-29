@@ -16,6 +16,12 @@ const CONTENT_FILTER_ERROR = new Error(
     '"content_filter_result":{"jailbreak":{"detected":true,"filtered":true}}}}}',
 );
 
+const GATEWAY_ECHO_ERROR = new Error(
+  'OpenAI API error (502): {"error":{"message":"upstream returned an error: ' +
+    '{\\"code\\":\\"content_filter\\",\\"innererror\\":' +
+    '{\\"code\\":\\"ResponsibleAIPolicyViolation\\"}}","code":"bad_gateway"}}',
+);
+
 function providerThatFails(err: Error, okAfter = Infinity): MemoryProvider {
   let calls = 0;
   return {
@@ -34,13 +40,28 @@ function providerThatFails(err: Error, okAfter = Infinity): MemoryProvider {
 describe("isPayloadRejection", () => {
   it("recognises Azure content filter rejections", () => {
     expect(isPayloadRejection(CONTENT_FILTER_ERROR)).toBe(true);
-    expect(isPayloadRejection(new Error("ResponsibleAIPolicyViolation"))).toBe(true);
+    expect(
+      isPayloadRejection(
+        new Error('OpenAI API error (400): {"error":{"code":"ResponsibleAIPolicyViolation"}}'),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not treat the filter code alone as a rejection", () => {
+    // No status means no evidence that the provider rejected this payload.
+    expect(isPayloadRejection(new Error("ResponsibleAIPolicyViolation"))).toBe(false);
   });
 
   it("treats genuine provider trouble as a failure", () => {
     expect(isPayloadRejection(new Error("OpenAI API error (503): upstream down"))).toBe(false);
     expect(isPayloadRejection(new Error("request timed out after 60000ms"))).toBe(false);
     expect(isPayloadRejection("socket hang up")).toBe(false);
+  });
+
+  it("does not excuse a gateway failure that merely quotes the filter body", () => {
+    // A 502 from an Azure gateway that echoes the upstream body. The tokens are
+    // present, the status is not 400: the provider is genuinely unhealthy.
+    expect(isPayloadRejection(GATEWAY_ECHO_ERROR)).toBe(false);
   });
 });
 
@@ -65,6 +86,16 @@ describe("ResilientProvider — content filter vs circuit breaker", () => {
 
     // Before this change the fourth call threw circuit_breaker_open instead.
     await expect(provider.compress("sys", "harmless")).resolves.toBe("<observation/>");
+  });
+
+  it("opens the breaker when a gateway failure quotes the filter body", async () => {
+    const provider = new ResilientProvider(providerThatFails(GATEWAY_ECHO_ERROR));
+
+    for (let i = 0; i < 3; i++) {
+      await expect(provider.compress("sys", "x")).rejects.toThrow(/502/);
+    }
+
+    expect(provider.circuitState.state).toBe("open");
   });
 
   it("still opens the breaker for real provider failures", async () => {
